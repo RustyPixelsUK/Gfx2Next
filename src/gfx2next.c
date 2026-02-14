@@ -44,7 +44,7 @@ int _CRT_glob = 0;
 #define CUTE_ASEPRITE_IMPLEMENTATION
 #include "cute_aseprite.h"
 
-#define VERSION						"1.1.20"
+#define VERSION						"1.1.21"
 
 #define DIR_SEPERATOR_CHAR			'\\'
 
@@ -150,6 +150,22 @@ uint8_t m_screenAttribsInk[] =
 
 typedef enum
 {
+    PAPER_LIGHTER,
+    PAPER_DARKER,
+    PAPER_BIGGER_AREA,
+    PAPER_SMALLER_AREA
+} screen_paper_strategy_t;
+
+typedef enum
+{
+    NEIGHBOR_NONE,
+    NEIGHBOR_LEFT,
+    NEIGHBOR_UP,
+    NEIGHBOR_MATCH
+} screen_neighbor_strategy_t;
+
+typedef enum
+{
 	COLORMODE_DISTANCE,
 	COLORMODE_ROUND,
 	COLORMODE_FLOOR,
@@ -205,13 +221,37 @@ typedef enum
 
 typedef struct
 {
+	uint8_t base;    // 0..7
+	uint8_t bright;  // 0/1
+} zx_col_t;
+
+typedef struct
+{
+    uint8_t colorCount;     // 1..2
+    uint32_t colors[2];     // RGB888 values from m_screenColors
+    uint8_t count[2];       // pixel count per color (0..64)
+    uint8_t pix[64];        // for each pixel: 0 or 1 (index into colors[])
+} block_t;
+
+typedef struct
+{
+    uint32_t paper;
+    uint32_t ink;
+    bool singleToInk; // only relevant if block.colorCount==1
+} block_attr_t;
+
+typedef struct
+{
 	char *in_filename;
 	char *out_filename;
 	bool debug;
 	bool font;
 	bool font_y;
 	bool screen;
-	bool screen_attribs;
+	bool screen_noattribs;
+	screen_paper_strategy_t screen_paper;
+    bool screen_single_use_ink;
+    screen_neighbor_strategy_t screen_neighbors;
 	bool bitmap;
 	bool bitmap_y;
 	bool sprites;
@@ -274,7 +314,10 @@ static arguments_t m_args  =
 	.debug = false,
 	.font = false,
 	.screen = false,
-	.screen_attribs = false,
+	.screen_noattribs = false,
+	.screen_paper = PAPER_LIGHTER,
+	.screen_single_use_ink = false,
+	.screen_neighbors = NEIGHBOR_NONE,
 	.bitmap = false,
 	.bitmap_y = false,
 	.sprites = false,
@@ -578,6 +621,141 @@ static uint8_t get_screen_color_attribs(uint32_t rgb888, bool useInk)
 	return (useInk ? m_screenAttribsInk[index] : m_screenAttribsPaper[index]);
 }
 
+static zx_col_t rgb_to_zx(uint32_t rgb888)
+{
+	// Using your existing mapping tables via "ink attribs" is easiest:
+	uint8_t a = get_screen_color_attribs(rgb888, true); // low 3 bits = color, 0x40 = bright
+	zx_col_t z;
+	z.base   = (uint8_t)(a & 0x07);
+	z.bright = (uint8_t)((a & 0x40) ? 1 : 0);
+	return z;
+}
+
+static uint32_t zx_to_rgb(uint8_t base, uint8_t bright)
+{
+	// Map (bright, base) -> your m_screenColors index
+	static const uint8_t lut[2][8] =
+	{
+		{ 0,  1,  3,  5,  7,  9, 11, 13 }, // normal
+		{ 0,  2,  4,  6,  8, 10, 12, 14 }  // bright (bright black -> black)
+	};
+	return m_screenColors[lut[bright ? 1 : 0][base & 7]];
+}
+
+// a “lighter/darker” rank. Retronator mostly compares base 0..7,
+// but including bright makes your option name match its intent better.
+static int zx_light_rank(uint32_t rgb888)
+{
+    zx_col_t z = rgb_to_zx(rgb888);
+    return (int)z.base + (z.bright ? 8 : 0);
+}
+
+	static void choose_paper_ink(const block_t* b, block_attr_t* a, screen_paper_strategy_t strat)
+	{
+	a->singleToInk = m_args.screen_single_use_ink;
+
+	if (b->colorCount == 1)
+	{
+		a->paper = b->colors[0];
+		a->ink   = b->colors[0];
+		return;
+	}
+
+	int i0, i1;
+	switch (strat)
+	{
+		case PAPER_LIGHTER:
+			i0 = zx_light_rank(b->colors[0]);
+			i1 = zx_light_rank(b->colors[1]);
+			// paper = lighter, ink = darker
+			if (i0 >= i1) { a->paper = b->colors[0]; a->ink = b->colors[1]; }
+			else          { a->paper = b->colors[1]; a->ink = b->colors[0]; }
+			break;
+
+		case PAPER_DARKER:
+			i0 = zx_light_rank(b->colors[0]);
+			i1 = zx_light_rank(b->colors[1]);
+			// paper = darker, ink = lighter
+			if (i0 <= i1) { a->paper = b->colors[0]; a->ink = b->colors[1]; }
+			else          { a->paper = b->colors[1]; a->ink = b->colors[0]; }
+			break;
+
+		case PAPER_BIGGER_AREA:
+		case PAPER_SMALLER_AREA:
+		{
+			// Retronator’s tie-break effectively favors colors[1] when 32/32.
+			bool c0_is_smaller = (b->count[0] < 32);
+			int smaller = c0_is_smaller ? 0 : 1;
+			int bigger  = 1 - smaller;
+
+			if (strat == PAPER_BIGGER_AREA) { a->paper = b->colors[bigger];  a->ink = b->colors[smaller]; }
+			else                             { a->paper = b->colors[smaller]; a->ink = b->colors[bigger]; }
+		} break;
+	}
+}
+
+static void analyze_neighbor(
+    const block_t* b, block_attr_t* a, bool* singleToInk,
+    const block_t* nb, const block_attr_t* na, bool nbSingleToInk)
+{
+	if (b->colorCount == 1)
+	{
+		uint32_t myColor = a->ink; // == a->paper initially
+
+		if (nb->colorCount == 1)
+		{
+			uint32_t nbUsedColor = nbSingleToInk ? na->ink : na->paper;
+			if (myColor == nbUsedColor)
+				*singleToInk = nbSingleToInk;
+		}
+		else
+		{
+			// If our single color equals neighbour's ink, be ink too.
+			*singleToInk = (myColor == na->ink);
+		}
+		return;
+	}
+
+	// We have 2 colors, may swap to match.
+	bool doSwitch = false;
+
+	if (nb->colorCount == 1)
+	{
+		if (nbSingleToInk)
+		{
+			// neighbor uses its color as ink; match our ink to theirs.
+			if (a->paper == na->ink) doSwitch = true;
+		}
+		else
+		{
+			// neighbor uses its color as paper; match our paper to theirs.
+			if (a->ink == na->paper) doSwitch = true;
+		}
+	}
+	else
+	{
+		// neighbor has 2 colors: switch if we can make at least one side match
+		if (a->paper == na->ink || a->ink == na->paper) doSwitch = true;
+	}
+
+	if (doSwitch)
+	{
+		uint32_t tmp = a->paper;
+		a->paper = a->ink;
+		a->ink = tmp;
+	}
+}
+
+static void finalize_single_color(block_attr_t* a, bool singleToInk)
+{
+	zx_col_t z = rgb_to_zx(a->ink); // same as paper at this point
+	uint8_t otherBase = (uint8_t)(7 - z.base);
+	uint32_t otherRgb = zx_to_rgb(otherBase, z.bright);
+
+	if (singleToInk) a->paper = otherRgb; // paper unused
+	else             a->ink   = otherRgb; // ink unused
+}
+
 static uint32_t get_nearest_screen_color(uint32_t rgb888)
 {
 	uint32_t match = 0;
@@ -873,6 +1051,9 @@ static void print_usage(void)
 	printf("  -font-y                 Get font in Y order first. (Default is X order first)\n");
 	printf("  -screen                 Sets output to Spectrum screen format (.scr)\n");
 	printf("  -screen-noattribs       Remove color attributes\n");
+	printf("  -screen-paper=<lighter|darker|bigger|smaller> Select which color becomes PAPER in each 8x8 attribute block (default: lighter)\n");
+	printf("  -screen-single=<paper|ink>                    For single-color attribute blocks, treat the color as PAPER (all bits 0) or INK (all bits 1) (default: paper)\n");
+	printf("  -screen-neighbors=<no|left|up|match>          Preserve neighbor colors by choosing/switching PAPER/INK to match Left/Up/Best match (default: no)\n");
 	printf("  -bitmap                 Sets output to Next bitmap mode (.nxi)\n");
 	printf("  -bitmap-y               Get bitmap in Y order first. (Default is X order first)\n");
 	printf("  -bitmap-size=XxY        Splits up the bitmap output file into X x Y sections\n");
@@ -984,9 +1165,34 @@ static bool parse_args(int argc, char *argv[], arguments_t *args)
 				m_args.screen = true;
 				m_args.pal_mode = PALMODE_NONE;
 			}
-			else if (!strcmp(argv[i], "-screen-attribs"))
+			else if (!strcmp(argv[i], "-screen-noattribs"))
 			{
-				m_args.screen_attribs = true;
+				m_args.screen_noattribs = true;
+			}
+			else if (!strncmp(argv[i], "-screen-paper=", 13))
+			{
+				const char* v = argv[i] + 13;
+				if      (!strcmp(v, "lighter")) m_args.screen_paper = PAPER_LIGHTER;
+				else if (!strcmp(v, "darker"))  m_args.screen_paper = PAPER_DARKER;
+				else if (!strcmp(v, "bigger"))  m_args.screen_paper = PAPER_BIGGER_AREA;
+				else if (!strcmp(v, "smaller")) m_args.screen_paper = PAPER_SMALLER_AREA;
+				else exit_with_msg("Bad -screen-paper value: %s\n", v);
+			}
+			else if (!strncmp(argv[i], "-screen-single=", 14))
+			{
+				const char* v = argv[i] + 14;
+				if      (!strcmp(v, "paper")) m_args.screen_single_use_ink = false;
+				else if (!strcmp(v, "ink"))   m_args.screen_single_use_ink = true;
+				else exit_with_msg("Bad -screen-single value: %s\n", v);
+			}
+			else if (!strncmp(argv[i], "-screen-neighbors=", 17))
+			{
+				const char* v = argv[i] + 17;
+				if      (!strcmp(v, "no"))    m_args.screen_neighbors = NEIGHBOR_NONE;
+				else if (!strcmp(v, "left"))  m_args.screen_neighbors = NEIGHBOR_LEFT;
+				else if (!strcmp(v, "up"))    m_args.screen_neighbors = NEIGHBOR_UP;
+				else if (!strcmp(v, "match")) m_args.screen_neighbors = NEIGHBOR_MATCH;
+				else exit_with_msg("Bad -screen-neighbors value: %s\n", v);
 			}
 			else if (!strcmp(argv[i], "-bitmap"))
 			{
@@ -2487,160 +2693,276 @@ static void write_font()
 
 static void write_screen()
 {
-	char screen_filename[256] = { 0 };
-	create_filename(screen_filename, m_args.out_filename, EXT_SCR, m_args.compress & COMPRESS_SCREEN);
-	FILE *p_file = fopen(screen_filename, "wb");
-	
-	if (p_file == NULL)
-	{
-		exit_with_msg("Can't create file %s.\n", screen_filename);
-	}
-	
-	uint32_t image_size = (m_image_width * m_image_height) / 8;
-	uint32_t cols_count = m_image_width / 8;
-	uint32_t rows_count = m_image_height / 8;
-	uint32_t attrib_size = cols_count * rows_count;
-	uint32_t total_size = (m_args.screen_attribs ? image_size : image_size + attrib_size);
-	uint8_t *p_buffer = malloc(total_size);
-	uint8_t *p_pixels = malloc(image_size);
-	uint32_t *p_attrib = malloc(attrib_size * sizeof(uint32_t) * 2);
-	
-	int pixelCount = 0;
-	int attribCount = 0;
-	
-	memset(p_buffer, 0, total_size);
-	
-	for (int y = 0; y < m_image_height; y += 8)
-	{
-		for (int x = 0; x < m_image_width; x += 8)
-		{
-			int attrCount = 0;
-			uint32_t attr[2] = { 0 };
-			uint32_t bitCount[2] = { 0 };
-			uint8_t byte[8];
-			
-			for (int j = 0; j < 8; j++)
-			{
-				uint8_t row = 0;
+    char screen_filename[256] = { 0 };
+    create_filename(screen_filename, m_args.out_filename, EXT_SCR, m_args.compress & COMPRESS_SCREEN);
 
-				for (int i = 0; i < 8; i++)
-				{
-					int index = x + i + (j + y) * m_image_width;
-					int colorIndex = m_next_image[index];
-					uint8_t r8 = m_palette[colorIndex * 4 + 1];
-					uint8_t g8 = m_palette[colorIndex * 4 + 2];
-					uint8_t b8 = m_palette[colorIndex * 4 + 3];
-					uint32_t rgb888 =  RGB888(r8, g8, b8);
-					uint32_t color = get_nearest_screen_color(rgb888);
-					
-					if (attrCount == 0)
-						attr[attrCount++] = color;
-					
-					if (color != attr[0])
+    FILE *p_file = fopen(screen_filename, "wb");
+    if (p_file == NULL)
+        exit_with_msg("Can't create file %s.\n", screen_filename);
+
+    // --- sizes ---
+    uint32_t image_size  = (m_image_width * m_image_height) / 8; // 6144 for 256x192
+    uint32_t cols_count  = m_image_width  / 8;                   // 32
+    uint32_t rows_count  = m_image_height / 8;                   // 24
+    uint32_t attrib_size = cols_count * rows_count;              // 768
+    uint32_t total_size  = (m_args.screen_noattribs ? image_size : (image_size + attrib_size));
+
+    uint8_t  *p_buffer = (uint8_t*)malloc(total_size);
+    uint8_t  *p_pixels = (uint8_t*)malloc(image_size);
+    uint32_t *p_attrib = (uint32_t*)malloc(attrib_size * sizeof(uint32_t) * 2);
+
+    if (!p_buffer || !p_pixels || !p_attrib)
+        exit_with_msg("Out of memory in write_screen()\n");
+
+    memset(p_buffer, 0, total_size);
+    memset(p_pixels, 0, image_size);
+
+    // --- NEW: analyze blocks first, then decide paper/ink like retronator does ---
+    block_t       *blocks       = (block_t*)malloc(sizeof(block_t) * attrib_size);
+    block_attr_t  *attrs        = (block_attr_t*)malloc(sizeof(block_attr_t) * attrib_size);
+    bool          *singleToInk  = (bool*)malloc(sizeof(bool) * attrib_size);
+
+    if (!blocks || !attrs || !singleToInk)
+        exit_with_msg("Out of memory in write_screen() (blocks)\n");
+
+    memset(blocks, 0, sizeof(block_t) * attrib_size);
+    memset(attrs, 0, sizeof(block_attr_t) * attrib_size);
+    memset(singleToInk, 0, sizeof(bool) * attrib_size);
+
+    // helper: overlap score (0..2) between two blocks' palettes
+    auto int palette_overlap(const block_t* a, const block_t* b)
+    {
+        int score = 0;
+        for (int i = 0; i < a->colorCount; i++)
+            for (int j = 0; j < b->colorCount; j++)
+                if (a->colors[i] == b->colors[j])
+                    score++;
+        return score;
+    }
+
+    // Pass A) Build per-8x8 block palette (max 2 colors) + per-pixel indices.
+    for (uint32_t by = 0; by < rows_count; by++)
+    {
+        for (uint32_t bx = 0; bx < cols_count; bx++)
+        {
+            const uint32_t bi = by * cols_count + bx;
+            block_t *b = &blocks[bi];
+
+            b->colorCount = 0;
+            b->colors[0] = b->colors[1] = 0;
+            b->count[0]  = b->count[1]  = 0;
+
+            for (int j = 0; j < 8; j++)
+            {
+                for (int i = 0; i < 8; i++)
+                {
+                    int x = (int)(bx * 8 + i);
+                    int y = (int)(by * 8 + j);
+
+                    int index = x + y * (int)m_image_width;
+                    int colorIndex = m_next_image[index];
+
+                    uint8_t r8 = m_palette[colorIndex * 4 + 1];
+                    uint8_t g8 = m_palette[colorIndex * 4 + 2];
+                    uint8_t b8 = m_palette[colorIndex * 4 + 3];
+
+                    uint32_t rgb888 = RGB888(r8, g8, b8);
+                    uint32_t c = get_nearest_screen_color(rgb888);
+
+                    // find/insert color into b->colors[]
+                    int ci = -1;
+                    for (int k = 0; k < b->colorCount; k++)
                     {
-						row |= 1 << (7 - i);
-                        // Increment bit count for ink
-                        bitCount[1]++;
+                        if (b->colors[k] == c)
+                        {
+                            ci = k;
+                            break;
+                        }
                     }
-                    else
+
+                    if (ci < 0)
                     {
-                        // Increment bit count for paper
-                        bitCount[0]++;
+                        if (b->colorCount >= 2)
+                            exit_with_msg("More than 2 colors in an attribute block at (%u, %u)\n", bx, by);
+                        ci = b->colorCount++;
+                        b->colors[ci] = c;
                     }
-					
-					bool attrFound = false;
-					
-					for (int k = 0; k < attrCount; k++)
-					{
-						if (attr[k] == color)
-							attrFound = true;
-					}
-					
-					if (!attrFound)
-					{
-						// Check attrCount before using it to prevent seg fault
-						if (attrCount > 1)
-							exit_with_msg("More than 2 colors in an attribute block at (%d, %d)\n", x/8, y/8);
-						attr[attrCount++] = color;
-					}
-				}
-				
-				byte[j] = row;
-			}
-			
-			if(attrCount != 2)
-			{
-				// If only one colour, try to find a match in an adjacent cell
-				if (attribCount)
-				{
-					uint32_t *prevAttr = &p_attrib[attribCount - 2];
-					
-					if (prevAttr[0] == attr[0])
-						attr[attrCount++] = prevAttr[1];
-				}
-				
-				if (attrCount != 2)
-					attr[attrCount++] = m_screenColors[0];
-			}
-			
-			// Improve compression ratio
-			//uint8_t paper = get_screen_color_attribs(attr[0], false);
-			//uint8_t ink = get_screen_color_attribs(attr[1], true);
-			
-            // If there are more ink bits than paper bits
-            // switch them.
-			if (bitCount[1] > bitCount[0])
-			{
-				uint32_t attrTemp = attr[0];
-				attr[0] = attr[1];
-				attr[1] = attrTemp;
 
-				for (int i = 0; i < 8; i++)
-					byte[i] = ~byte[i] & 0xff;
-			}
+                    b->pix[j * 8 + i] = (uint8_t)ci;
+                    b->count[ci]++;
+                }
+            }
 
-			for (int i = 0; i < 8; i++)
-				p_pixels[pixelCount++] = byte[i];
+            if (b->colorCount == 0)
+            {
+                // should never happen, but keep safe
+                b->colorCount = 1;
+                b->colors[0] = m_screenColors[0];
+                b->count[0] = 64;
+                memset(b->pix, 0, 64);
+            }
+        }
+    }
 
-			p_attrib[attribCount++] = attr[0];
-			p_attrib[attribCount++] = attr[1];
-		}
-	}
-	
-	if (!m_args.screen_attribs)
-	{
-		for (int i = 0; i < attribCount >> 1; i++)
-		{
-			uint8_t paper = get_screen_color_attribs(p_attrib[i * 2], false);
-			uint8_t ink = get_screen_color_attribs(p_attrib[i * 2 + 1], true);
+    // Pass B) Choose paper/ink per block (paper strategy + neighbor preservation + single-color rule)
+    for (uint32_t by = 0; by < rows_count; by++)
+    {
+        for (uint32_t bx = 0; bx < cols_count; bx++)
+        {
+            const uint32_t bi = by * cols_count + bx;
+            const block_t *b = &blocks[bi];
 
-			p_buffer[image_size + i] = (paper | ink);
-		}
-	}
-	
-	int pixelIndex = 0;
-	
-	for (int block = 0; block < 3; block++)
-	{
-		for (int col = 0; col < 8; col++)
-		{
-			for (int row = 0; row < 8; row++)
-			{
-				for (int line = 0; line < 32; line++)
-				{
-					p_buffer[pixelIndex++] = p_pixels[(block * 8 * 8 * 32) + (row * 32 * 8) + (line * 8) + col];
-				}
-			}
-		}
-	}
-	
-	free(p_pixels);
-	free(p_attrib);
-	
-	write_file(p_file, screen_filename, p_buffer, total_size, false, m_args.compress & COMPRESS_SCREEN);
-	
-	free(p_buffer);
-	fclose(p_file);
+            block_attr_t a = { 0 };
+            bool s2i = m_args.screen_single_use_ink; // default: Paper=false, Ink=true (you set default false)
+
+            choose_paper_ink(b, &a, m_args.screen_paper);
+
+            // neighbor strategy (replicates retronator ordering quirks)
+            if (m_args.screen_neighbors != NEIGHBOR_NONE)
+            {
+                const bool hasLeft = (bx > 0);
+                const bool hasUp   = (by > 0);
+
+                const uint32_t li = hasLeft ? (bi - 1) : 0;
+                const uint32_t ui = hasUp   ? (bi - cols_count) : 0;
+
+                if (m_args.screen_neighbors == NEIGHBOR_LEFT)
+                {
+                    // retronator tries UP then LEFT for the "Left" option
+                    if (hasUp)
+                        analyze_neighbor(b, &a, &s2i, &blocks[ui], &attrs[ui], singleToInk[ui]);
+                    if (hasLeft)
+                        analyze_neighbor(b, &a, &s2i, &blocks[li], &attrs[li], singleToInk[li]);
+                }
+                else if (m_args.screen_neighbors == NEIGHBOR_UP)
+                {
+                    // retronator tries LEFT then UP for the "Up" option
+                    if (hasLeft)
+                        analyze_neighbor(b, &a, &s2i, &blocks[li], &attrs[li], singleToInk[li]);
+                    if (hasUp)
+                        analyze_neighbor(b, &a, &s2i, &blocks[ui], &attrs[ui], singleToInk[ui]);
+                }
+                else if (m_args.screen_neighbors == NEIGHBOR_MATCH)
+                {
+                    if (hasLeft && hasUp)
+                    {
+                        int ol = palette_overlap(b, &blocks[li]);
+                        int ou = palette_overlap(b, &blocks[ui]);
+
+                        // Try the better-matching neighbor first (tie: UP first)
+                        if (ou >= ol)
+                        {
+                            analyze_neighbor(b, &a, &s2i, &blocks[ui], &attrs[ui], singleToInk[ui]);
+                            analyze_neighbor(b, &a, &s2i, &blocks[li], &attrs[li], singleToInk[li]);
+                        }
+                        else
+                        {
+                            analyze_neighbor(b, &a, &s2i, &blocks[li], &attrs[li], singleToInk[li]);
+                            analyze_neighbor(b, &a, &s2i, &blocks[ui], &attrs[ui], singleToInk[ui]);
+                        }
+                    }
+                    else if (hasUp)
+                    {
+                        analyze_neighbor(b, &a, &s2i, &blocks[ui], &attrs[ui], singleToInk[ui]);
+                    }
+                    else if (hasLeft)
+                    {
+                        analyze_neighbor(b, &a, &s2i, &blocks[li], &attrs[li], singleToInk[li]);
+                    }
+                }
+            }
+
+            // Single-color blocks: make the "unused" attribute differ, and decide bitmap fill (00 or FF)
+            if (b->colorCount == 1)
+                finalize_single_color(&a, s2i);
+
+            attrs[bi] = a;
+            singleToInk[bi] = s2i;
+        }
+    }
+
+    // Pass C) Emit bitmap bytes in block scan order (top-to-bottom blocks, left-to-right blocks),
+    //         and record attrib pairs (paper, ink) per cell.
+    int pixelCount  = 0;
+    int attribCount = 0;
+
+    for (uint32_t by = 0; by < rows_count; by++)
+    {
+        for (uint32_t bx = 0; bx < cols_count; bx++)
+        {
+            const uint32_t bi = by * cols_count + bx;
+            const block_t *b  = &blocks[bi];
+            const block_attr_t *a = &attrs[bi];
+
+            // store attrs as RGB888 (later converted to ZX attrib byte)
+            p_attrib[attribCount++] = a->paper;
+            p_attrib[attribCount++] = a->ink;
+
+            if (b->colorCount == 1)
+            {
+                uint8_t fill = singleToInk[bi] ? 0xFF : 0x00;
+                for (int j = 0; j < 8; j++)
+                    p_pixels[pixelCount++] = fill;
+            }
+            else
+            {
+                int inkIndex = (b->colors[0] == a->ink) ? 0 : 1;
+
+                for (int j = 0; j < 8; j++)
+                {
+                    uint8_t rowByte = 0;
+                    for (int i = 0; i < 8; i++)
+                    {
+                        uint8_t ci = b->pix[j * 8 + i];
+                        if (ci == inkIndex)
+                            rowByte |= (uint8_t)(1 << (7 - i)); // 1 = ink
+                    }
+                    p_pixels[pixelCount++] = rowByte;
+                }
+            }
+        }
+    }
+
+    // Write attribute bytes
+    if (!m_args.screen_noattribs)
+    {
+        for (int i = 0; i < (attribCount >> 1); i++)
+        {
+            uint8_t paper = get_screen_color_attribs(p_attrib[i * 2], false);
+            uint8_t ink   = get_screen_color_attribs(p_attrib[i * 2 + 1], true);
+            p_buffer[image_size + i] = (uint8_t)(paper | ink);
+        }
+    }
+
+    // Convert linear pixel blocks to ZX Spectrum screen memory layout
+    int pixelIndex = 0;
+    for (int block = 0; block < 3; block++)
+    {
+        for (int col = 0; col < 8; col++)
+        {
+            for (int row = 0; row < 8; row++)
+            {
+                for (int line = 0; line < 32; line++)
+                {
+                    p_buffer[pixelIndex++] =
+                        p_pixels[(block * 8 * 8 * 32) + (row * 32 * 8) + (line * 8) + col];
+                }
+            }
+        }
+    }
+
+    // cleanup + write
+    free(blocks);
+    free(attrs);
+    free(singleToInk);
+
+    free(p_pixels);
+    free(p_attrib);
+
+    write_file(p_file, screen_filename, p_buffer, total_size, false, m_args.compress & COMPRESS_SCREEN);
+
+    free(p_buffer);
+    fclose(p_file);
 }
 
 static void write_attribs()

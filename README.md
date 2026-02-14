@@ -28,6 +28,9 @@ gfx2next [options] &lt;srcfile&gt; [&lt;dstfile&gt;]
 |-font-y|Get font in Y order first. (Default is X order first)|
 |-screen|Sets output to Spectrum screen format (.scr)|
 |-screen-noattribs|Remove color attributes|
+|-screen-paper=\<lighter\|darker\|bigger\|smaller\>|Select which color becomes PAPER in each 8x8 attribute block (default: lighter)|
+|-screen-single=\<paper\|ink\>|For single-color attribute blocks, treat the color as PAPER (all bits 0) or INK (all bits 1) (default: paper)|
+|-screen-neighbors=\<no\|left\|up\|match\>|Preserve neighbor colors by choosing/switching PAPER/INK to match Left/Up/Best match (default: no)|
 |-bitmap|Sets output to Next bitmap mode (.nxi)|
 |-bitmap-y|Get bitmap in Y order first. (Default is X order first)|
 |-bitmap-size=XxY|Splits up the bitmap output file into X x Y sections|
