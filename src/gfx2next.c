@@ -608,6 +608,16 @@ static uint16_t rgb888_to_rgb444(uint32_t rgb888, color_mode_t color_mode)
 	return RGB444(r4, g4, b4);
 }
 
+static int palette_overlap(const block_t* a, const block_t* b)
+{
+	int score = 0;
+	for (int i = 0; i < a->colorCount; i++)
+		for (int j = 0; j < b->colorCount; j++)
+			if (a->colors[i] == b->colors[j])
+				score++;
+	return score;
+}
+
 static uint8_t get_screen_color_attribs(uint32_t rgb888, bool useInk)
 {
 	int index = 0;
@@ -2728,17 +2738,6 @@ static void write_screen()
     memset(blocks, 0, sizeof(block_t) * attrib_size);
     memset(attrs, 0, sizeof(block_attr_t) * attrib_size);
     memset(singleToInk, 0, sizeof(bool) * attrib_size);
-
-    // helper: overlap score (0..2) between two blocks' palettes
-    auto int palette_overlap(const block_t* a, const block_t* b)
-    {
-        int score = 0;
-        for (int i = 0; i < a->colorCount; i++)
-            for (int j = 0; j < b->colorCount; j++)
-                if (a->colors[i] == b->colors[j])
-                    score++;
-        return score;
-    }
 
     // Pass A) Build per-8x8 block palette (max 2 colors) + per-pixel indices.
     for (uint32_t by = 0; by < rows_count; by++)
