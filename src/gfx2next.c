@@ -44,7 +44,7 @@ int _CRT_glob = 0;
 #define CUTE_ASEPRITE_IMPLEMENTATION
 #include "cute_aseprite.h"
 
-#define VERSION						"1.1.21"
+#define VERSION						"1.1.22"
 
 #define DIR_SEPERATOR_CHAR			'\\'
 
@@ -3961,7 +3961,8 @@ static void process_tiles()
 	{
 		uint32_t map_width = m_image_width / (m_tile_width * m_block_width);
 		uint32_t map_height = m_image_height / (m_tile_height * m_block_height);
-	
+		m_chunk_size = m_tile_size;
+
 		if (m_args.tile_y)
 		{
 			for (int x = 0; x < map_width; x++)
