@@ -44,7 +44,7 @@ int _CRT_glob = 0;
 #define CUTE_ASEPRITE_IMPLEMENTATION
 #include "cute_aseprite.h"
 
-#define VERSION						"1.1.22"
+#define VERSION						"1.1.23"
 
 #define DIR_SEPERATOR_CHAR			'\\'
 
@@ -2283,7 +2283,7 @@ static void write_asm_file(char *p_filename, uint32_t data_size)
 		fprintf(m_asm_file, "\nEXPORT %s\n", label);
 		fprintf(m_asm_file, "EXPORT %s_end\n", label);
 		fprintf(m_asm_file, "\n%s\n", label);
-		fprintf(m_asm_file, "\n\tincbin \"binary/%s\"\t; %d bytes\n", p_filename, data_size);
+		fprintf(m_asm_file, "\n\tincbin \"binary/%s\"\n", p_filename);
 		fprintf(m_asm_file, "\n%s_end\n", label);
 	}
 	else if (m_args.asm_mode == ASMMODE_Z80ASM)
@@ -2321,7 +2321,7 @@ static void write_asm_file(char *p_filename, uint32_t data_size)
 		fprintf(m_asm_file, "\nPUBLIC _%s\n", label);
 		fprintf(m_asm_file, "PUBLIC _%s_end\n", label);
 		fprintf(m_asm_file, "\n_%s:\n", label);
-		fprintf(m_asm_file, "\n\tBINARY \"binary/%s\"\t; %d bytes\n", p_filename, data_size);
+		fprintf(m_asm_file, "\n\tBINARY \"binary/%s\"\n", p_filename);
 		fprintf(m_asm_file, "\n_%s_end:\n", label);
 	}
 }
@@ -2369,10 +2369,17 @@ static void write_asm_sequence()
 	}
 }
 
-static void write_header_file(char *p_filename, bool type_16bit)
+static void write_header_file(char *p_filename, bool type_16bit, uint32_t data_size)
 {
+	char size_label[256] = { 0 };
+
 	alphanumeric_to_underscore(p_filename);
-	
+
+	strcpy(size_label, p_filename);
+	for (int i = 0; size_label[i]; i++)
+		size_label[i] = toupper((int) size_label[i]);
+
+	fprintf(m_header_file, "\n#define %s_SIZE %u\n\n", size_label, data_size);
 	fprintf(m_header_file, "extern %s %s[];\n", type_16bit ? "uint16_t" : "uint8_t", p_filename);
 	fprintf(m_header_file, "extern uint8_t %s_end[];\n", p_filename);
 }
@@ -2386,7 +2393,7 @@ static void write_header_header(char *p_filename)
 	alphanumeric_to_underscore(header_filename);
 
 	fprintf(m_header_file, "#ifndef _%s\n", header_filename);
-	fprintf(m_header_file, "#define _%s\n\n", header_filename);
+	fprintf(m_header_file, "#define _%s\n", header_filename);
 }
 
 static void write_header_footer()
@@ -2428,10 +2435,10 @@ static void write_file(FILE *p_file, char *p_filename, uint8_t *p_buffer, uint32
 		if (m_args.asm_mode > ASMMODE_NONE)
 		{
 			write_asm_file(p_filename, compressed_size);
-			
+
 			if (m_args.asm_mode == ASMMODE_Z80ASM)
 			{
-				write_header_file(p_filename, false);
+				write_header_file(p_filename, false, compressed_size);
 			}
 		}
 		
@@ -2448,10 +2455,10 @@ static void write_file(FILE *p_file, char *p_filename, uint8_t *p_buffer, uint32
 		if (m_args.asm_mode > ASMMODE_NONE)
 		{
 			write_asm_file(p_filename, buffer_size);
-			
+
 			if (m_args.asm_mode == ASMMODE_Z80ASM)
 			{
-				write_header_file(p_filename, type_16bit);
+				write_header_file(p_filename, type_16bit, buffer_size);
 			}
 		}
 		
