@@ -44,7 +44,7 @@ int _CRT_glob = 0;
 #define CUTE_ASEPRITE_IMPLEMENTATION
 #include "cute_aseprite.h"
 
-#define VERSION						"1.1.23"
+#define VERSION						"1.1.24"
 
 #define DIR_SEPERATOR_CHAR			'\\'
 
@@ -1884,7 +1884,7 @@ static void read_bitmap()
 	// Convert 4-bit to 8-bit data
 	if (bpp == 4)
 	{
-		for (int i = m_image_size-2; i >= 0; i--)
+		for (int i = m_image_size-1; i >= 0; i--)
 		{
 			uint8_t value = m_image[i >> 1];
 			
